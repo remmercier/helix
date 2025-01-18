@@ -1,0 +1,1450 @@
+From af66bc29dea943eeb7fb2de69442a646eb2082c8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?R=C3=A9mi=20Mercier?= <rem.mercier@gmail.com>
+Date: Sat, 18 Jan 2025 13:12:16 -0500
+Subject: [PATCH] merge 3-9143/persistent_state
+
+---
+ Cargo.lock                           |  25 +++++
+ Cargo.toml                           |   1 +
+ book/src/editor.md                   |  16 ++++
+ book/src/generated/typable-cmd.md    |   1 +
+ helix-core/Cargo.toml                |   4 +-
+ helix-core/src/selection.rs          |   5 +-
+ helix-loader/Cargo.toml              |   1 +
+ helix-loader/src/lib.rs              |  87 +++++++++++++++++
+ helix-loader/src/persistence.rs      |  72 ++++++++++++++
+ helix-term/src/application.rs        |  96 ++++++++++++++++---
+ helix-term/src/args.rs               |  19 ++--
+ helix-term/src/commands.rs           |   5 +
+ helix-term/src/commands/typed.rs     |  75 ++++++++++++++-
+ helix-term/src/main.rs               |   4 +
+ helix-term/src/ui/prompt.rs          |   7 +-
+ helix-term/tests/integration.rs      |   1 +
+ helix-term/tests/test/helpers.rs     |   3 +-
+ helix-term/tests/test/persistence.rs | 138 +++++++++++++++++++++++++++
+ helix-view/Cargo.toml                |   3 +
+ helix-view/src/editor.rs             | 135 +++++++++++++++++++++++++-
+ helix-view/src/lib.rs                |   2 +
+ helix-view/src/persistence.rs        |  81 ++++++++++++++++
+ helix-view/src/regex.rs              |  37 +++++++
+ helix-view/src/view.rs               |   3 +-
+ 24 files changed, 783 insertions(+), 38 deletions(-)
+ create mode 100644 helix-loader/src/persistence.rs
+ create mode 100644 helix-term/tests/test/persistence.rs
+ create mode 100644 helix-view/src/persistence.rs
+ create mode 100644 helix-view/src/regex.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index d7ed00e9..4ad44da8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -99,6 +99,15 @@ dependencies = [
+  "rustc-demangle",
+ ]
+ 
++[[package]]
++name = "bincode"
++version = "1.3.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
++dependencies = [
++ "serde",
++]
++
+ [[package]]
+ name = "bitflags"
+ version = "2.7.0"
+@@ -1358,6 +1367,7 @@ name = "helix-loader"
+ version = "25.1.0"
+ dependencies = [
+  "anyhow",
++ "bincode",
+  "cc",
+  "dunce",
+  "etcetera",
+@@ -1528,9 +1538,11 @@ dependencies = [
+  "log",
+  "once_cell",
+  "parking_lot",
++ "regex",
+  "rustix",
+  "serde",
+  "serde_json",
++ "serde_regex",
+  "slotmap",
+  "tempfile",
+  "thiserror 2.0.11",
+@@ -2277,6 +2289,16 @@ dependencies = [
+  "serde",
+ ]
+ 
++[[package]]
++name = "serde_regex"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a8136f1a4ea815d7eac4101cfd0b16dc0cb5e1fe1b8609dfd728058656b7badf"
++dependencies = [
++ "regex",
++ "serde",
++]
++
+ [[package]]
+ name = "serde_repr"
+ version = "0.1.19"
+@@ -2380,6 +2402,9 @@ name = "smallvec"
+ version = "1.13.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "3c5e1a9a646d36c3599cd173a41282daf47c44583ad367b8e6837255952e5c67"
++dependencies = [
++ "serde",
++]
+ 
+ [[package]]
+ name = "smartstring"
+diff --git a/Cargo.toml b/Cargo.toml
+index 34fa28ff..d983d70e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -43,6 +43,7 @@ slotmap = "1.0.7"
+ thiserror = "2.0"
+ tempfile = "3.15.0"
+ bitflags = "2.7"
++regex = "1"
+ 
+ [workspace.package]
+ version = "25.1.0"
+diff --git a/book/src/editor.md b/book/src/editor.md
+index 4d144d6d..e04ff403 100644
+--- a/book/src/editor.md
++++ b/book/src/editor.md
+@@ -487,3 +487,19 @@ ### `[editor.sticky-context]` Section
+ indicator = true
+ max-lines = 10
+ ```
++### `[editor.persistence]` Section
++
++Options for persisting editor state between sessions.
++
++The state is formatted with bincode, and stored in files in the state directory (`~/.local/state/helix` on Unix, `~\Local Settings\Application Data\helix\state` on Windows). You can reset your persisted state (and recover from any corruption) by deleting these files.
++
++| Key | Description | Default |
++| --- | ----------- | ------- |
++| `old-files` | whether to persist file locations between sessions ( when you reopen the a file, it will open at the place you last closed it) | `false` |
++| `commands` | whether to persist command history between sessions | `false` |
++| `search` | whether to persist search history between sessions | `false` |
++| `clipboard` | whether to persist helix's internal clipboard between sessions | `false` |
++| `old-files-exclusions` | a list of regexes defining file paths to exclude from persistence | `[".*/\.git/.*", ".*/COMMIT_EDITMSG"]` |
++| `old-files-trim` | number of old-files entries to keep when helix trims the state files at startup | `100` |
++| `commands-trim` | number of command history entries to keep when helix trims the state files at startup | `100` |
++| `search-trim` | number of search history entries to keep when helix trims the state files at startup | `100` |
+diff --git a/book/src/generated/typable-cmd.md b/book/src/generated/typable-cmd.md
+index f0d9a0f4..4fb6d419 100644
+--- a/book/src/generated/typable-cmd.md
++++ b/book/src/generated/typable-cmd.md
+@@ -88,3 +88,4 @@
+ | `:move`, `:mv` | Move the current buffer and its corresponding file to a different path |
+ | `:yank-diagnostic` | Yank diagnostic(s) under primary cursor to register, or clipboard by default |
+ | `:read`, `:r` | Load a file into buffer |
++| `:reload-history` | Reload history files for persistent state |
+diff --git a/helix-core/Cargo.toml b/helix-core/Cargo.toml
+index b8821c41..137b783c 100644
+--- a/helix-core/Cargo.toml
++++ b/helix-core/Cargo.toml
+@@ -21,7 +21,7 @@ helix-loader = { path = "../helix-loader" }
+ helix-parsec = { path = "../helix-parsec" }
+ 
+ ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
+-smallvec = "1.13"
++smallvec = { version = "1.13", features = ["serde"] }
+ smartstring = "1.0.1"
+ unicode-segmentation = "1.12"
+ # unicode-width is changing width definitions
+@@ -35,8 +35,8 @@ slotmap.workspace = true
+ tree-sitter.workspace = true
+ once_cell = "1.20"
+ arc-swap = "1"
+-regex = "1"
+ bitflags.workspace = true
++regex.workspace = true
+ ahash = "0.8.11"
+ hashbrown = { version = "0.14.5", features = ["raw"] }
+ dunce = "1.0"
+diff --git a/helix-core/src/selection.rs b/helix-core/src/selection.rs
+index 76de6362..9958266e 100644
+--- a/helix-core/src/selection.rs
++++ b/helix-core/src/selection.rs
+@@ -13,6 +13,7 @@
+ };
+ use helix_stdx::range::is_subset;
+ use helix_stdx::rope::{self, RopeSliceExt};
++use serde::{Deserialize, Serialize};
+ use smallvec::{smallvec, SmallVec};
+ use std::{borrow::Cow, iter, slice};
+ use tree_sitter::Node;
+@@ -51,7 +52,7 @@
+ /// single grapheme inward from the range's edge.  There are a
+ /// variety of helper methods on `Range` for working in terms of
+ /// that block cursor, all of which have `cursor` in their name.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct Range {
+     /// The anchor of the range: the side that doesn't move when extending.
+     pub anchor: usize,
+@@ -413,7 +414,7 @@ fn from(range: Range) -> Self {
+ 
+ /// A selection consists of one or more selection ranges.
+ /// invariant: A selection can never be empty (always contains at least primary range).
+-#[derive(Debug, Clone, PartialEq, Eq)]
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct Selection {
+     ranges: SmallVec<[Range; 1]>,
+     primary_index: usize,
+diff --git a/helix-loader/Cargo.toml b/helix-loader/Cargo.toml
+index d97bf9d1..a5495cb3 100644
+--- a/helix-loader/Cargo.toml
++++ b/helix-loader/Cargo.toml
+@@ -24,6 +24,7 @@ etcetera = "0.8"
+ tree-sitter.workspace = true
+ once_cell = "1.20"
+ log = "0.4"
++bincode = "1.3.3"
+ 
+ # TODO: these two should be on !wasm32 only
+ 
+diff --git a/helix-loader/src/lib.rs b/helix-loader/src/lib.rs
+index 0e7c134d..264c6ff0 100644
+--- a/helix-loader/src/lib.rs
++++ b/helix-loader/src/lib.rs
+@@ -1,5 +1,6 @@
+ pub mod config;
+ pub mod grammar;
++pub mod persistence;
+ 
+ use helix_stdx::{env::current_working_dir, path};
+ 
+@@ -15,6 +16,14 @@
+ 
+ static LOG_FILE: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
+ 
++static COMMAND_HISTFILE: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
++
++static SEARCH_HISTFILE: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
++
++static FILE_HISTFILE: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
++
++static CLIPBOARD_FILE: once_cell::sync::OnceCell<PathBuf> = once_cell::sync::OnceCell::new();
++
+ pub fn initialize_config_file(specified_file: Option<PathBuf>) {
+     let config_file = specified_file.unwrap_or_else(default_config_file);
+     ensure_parent_dir(&config_file);
+@@ -27,6 +36,30 @@ pub fn initialize_log_file(specified_file: Option<PathBuf>) {
+     LOG_FILE.set(log_file).ok();
+ }
+ 
++pub fn initialize_command_histfile(specified_file: Option<PathBuf>) {
++    let command_histfile = specified_file.unwrap_or_else(default_command_histfile);
++    ensure_parent_dir(&command_histfile);
++    COMMAND_HISTFILE.set(command_histfile).ok();
++}
++
++pub fn initialize_search_histfile(specified_file: Option<PathBuf>) {
++    let search_histfile = specified_file.unwrap_or_else(default_search_histfile);
++    ensure_parent_dir(&search_histfile);
++    SEARCH_HISTFILE.set(search_histfile).ok();
++}
++
++pub fn initialize_file_histfile(specified_file: Option<PathBuf>) {
++    let file_histfile = specified_file.unwrap_or_else(default_file_histfile);
++    ensure_parent_dir(&file_histfile);
++    FILE_HISTFILE.set(file_histfile).ok();
++}
++
++pub fn initialize_clipboard_file(specified_file: Option<PathBuf>) {
++    let clipboard_file = specified_file.unwrap_or_else(default_clipboard_file);
++    ensure_parent_dir(&clipboard_file);
++    CLIPBOARD_FILE.set(clipboard_file).ok();
++}
++
+ /// A list of runtime directories from highest to lowest priority
+ ///
+ /// The priority is:
+@@ -132,6 +165,22 @@ pub fn cache_dir() -> PathBuf {
+     path
+ }
+ 
++pub fn state_dir() -> PathBuf {
++    // TODO: allow env var override
++    let strategy = choose_base_strategy().expect("Unable to find the state directory!");
++    match strategy.state_dir() {
++        Some(mut path) => {
++            path.push("helix");
++            path
++        }
++        None => {
++            let mut path = strategy.cache_dir();
++            path.push("helix/state");
++            path
++        }
++    }
++}
++
+ pub fn config_file() -> PathBuf {
+     CONFIG_FILE.get().map(|path| path.to_path_buf()).unwrap()
+ }
+@@ -140,6 +189,28 @@ pub fn log_file() -> PathBuf {
+     LOG_FILE.get().map(|path| path.to_path_buf()).unwrap()
+ }
+ 
++pub fn command_histfile() -> PathBuf {
++    COMMAND_HISTFILE
++        .get()
++        .map(|path| path.to_path_buf())
++        .unwrap()
++}
++
++pub fn search_histfile() -> PathBuf {
++    SEARCH_HISTFILE
++        .get()
++        .map(|path| path.to_path_buf())
++        .unwrap()
++}
++
++pub fn file_histfile() -> PathBuf {
++    FILE_HISTFILE.get().map(|path| path.to_path_buf()).unwrap()
++}
++
++pub fn clipboard_file() -> PathBuf {
++    CLIPBOARD_FILE.get().map(|path| path.to_path_buf()).unwrap()
++}
++
+ pub fn workspace_config_file() -> PathBuf {
+     find_workspace().0.join(".helix").join("config.toml")
+ }
+@@ -152,6 +223,22 @@ pub fn default_log_file() -> PathBuf {
+     cache_dir().join("helix.log")
+ }
+ 
++pub fn default_command_histfile() -> PathBuf {
++    state_dir().join("command_history")
++}
++
++pub fn default_search_histfile() -> PathBuf {
++    state_dir().join("search_history")
++}
++
++pub fn default_file_histfile() -> PathBuf {
++    state_dir().join("file_history")
++}
++
++pub fn default_clipboard_file() -> PathBuf {
++    state_dir().join("clipboard")
++}
++
+ /// Merge two TOML documents, merging values from `right` onto `left`
+ ///
+ /// When an array exists in both `left` and `right`, `right`'s array is
+diff --git a/helix-loader/src/persistence.rs b/helix-loader/src/persistence.rs
+new file mode 100644
+index 00000000..01997779
+--- /dev/null
++++ b/helix-loader/src/persistence.rs
+@@ -0,0 +1,72 @@
++use bincode::{deserialize_from, serialize_into};
++use serde::{Deserialize, Serialize};
++use std::{
++    fs::{File, OpenOptions},
++    io::{self, BufReader},
++    path::PathBuf,
++};
++
++pub fn write_history<T: Serialize>(filepath: PathBuf, entries: &Vec<T>) {
++    let file = OpenOptions::new()
++        .write(true)
++        .create(true)
++        .truncate(true)
++        .open(filepath)
++        .unwrap();
++
++    for entry in entries {
++        serialize_into(&file, &entry).unwrap();
++    }
++}
++
++pub fn push_history<T: Serialize>(filepath: PathBuf, entry: &T) {
++    let file = OpenOptions::new()
++        .append(true)
++        .create(true)
++        .open(filepath)
++        .unwrap();
++
++    serialize_into(file, entry).unwrap();
++}
++
++pub fn read_history<T: for<'a> Deserialize<'a>>(filepath: &PathBuf) -> Vec<T> {
++    match File::open(filepath) {
++        Ok(file) => {
++            let mut read = BufReader::new(file);
++            let mut entries = Vec::new();
++            // FIXME: Can we do better error handling here? It's unfortunate that bincode doesn't
++            // distinguish an empty reader from an actual error.
++            //
++            // Perhaps we could use the underlying bufreader to check for emptiness in the while
++            // condition, then we could know any errors from bincode should be surfaced or logged.
++            // BufRead has a method `has_data_left` that would work for this, but at the time of
++            // writing it is nightly-only and experimental :(
++            while let Ok(entry) = deserialize_from(&mut read) {
++                entries.push(entry);
++            }
++            entries
++        }
++        Err(e) => match e.kind() {
++            io::ErrorKind::NotFound => Vec::new(),
++            // Going through the potential errors listed from the docs:
++            // - `InvalidInput` can't happen since we aren't setting options
++            // - `AlreadyExists` can't happen since we aren't setting `create_new`
++            // - `PermissionDenied` could happen if someone really borked their file permissions
++            //   in `~/.local`, but helix already panics in that case, and I think a panic is
++            //   acceptable.
++            _ => unreachable!(),
++        },
++    }
++}
++
++pub fn trim_history<T: Clone + Serialize + for<'a> Deserialize<'a>>(
++    filepath: PathBuf,
++    limit: usize,
++) {
++    let history: Vec<T> = read_history(&filepath);
++    if history.len() > limit {
++        let trim_start = history.len() - limit;
++        let trimmed_history = history[trim_start..].to_vec();
++        write_history(filepath, &trimmed_history);
++    }
++}
+diff --git a/helix-term/src/application.rs b/helix-term/src/application.rs
+index 36cb295c..c233403d 100644
+--- a/helix-term/src/application.rs
++++ b/helix-term/src/application.rs
+@@ -13,7 +13,7 @@
+     editor::{ConfigEvent, EditorEvent},
+     events::DiagnosticsDidChange,
+     graphics::Rect,
+-    theme,
++    persistence, theme,
+     tree::Layout,
+     Align, Editor,
+ };
+@@ -25,7 +25,7 @@
+     compositor::{Compositor, Event},
+     config::Config,
+     handlers,
+-    job::Jobs,
++    job::{Job, Jobs},
+     keymap::Keymaps,
+     ui::{self, overlay::overlaid},
+ };
+@@ -33,7 +33,12 @@
+ use log::{debug, error, info, warn};
+ #[cfg(not(feature = "integration"))]
+ use std::io::stdout;
+-use std::{collections::btree_map::Entry, io::stdin, path::Path, sync::Arc};
++use std::{
++    collections::{btree_map::Entry, HashMap},
++    io::stdin,
++    path::Path,
++    sync::Arc,
++};
+ 
+ #[cfg(not(windows))]
+ use anyhow::Context;
+@@ -138,6 +143,16 @@ pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Se
+         let mut compositor = Compositor::new(area);
+         let config = Arc::new(ArcSwap::from_pointee(config));
+         let handlers = handlers::setup(config.clone());
++        let persistence_config = config.load().editor.persistence.clone();
++        let old_file_locs = if persistence_config.old_files {
++            HashMap::from_iter(
++                persistence::read_file_history()
++                    .into_iter()
++                    .map(|entry| (entry.path.clone(), (entry.view_position, entry.selection))),
++            )
++        } else {
++            HashMap::new()
++        };
+         let mut editor = Editor::new(
+             area,
+             theme_loader.clone(),
+@@ -146,8 +161,29 @@ pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Se
+                 &config.editor
+             })),
+             handlers,
++            old_file_locs,
+         );
+ 
++        // Should we be doing these in background tasks?
++        if persistence_config.commands {
++            editor
++                .registers
++                .write(':', persistence::read_command_history())
++                .unwrap();
++        }
++        if persistence_config.search {
++            editor
++                .registers
++                .write('/', persistence::read_search_history())
++                .unwrap();
++        }
++        if persistence_config.clipboard {
++            editor
++                .registers
++                .write('"', persistence::read_clipboard_file())
++                .unwrap();
++        }
++
+         let keys = Box::new(Map::new(Arc::clone(&config), |config: &Config| {
+             &config.keys
+         }));
+@@ -190,7 +226,7 @@ pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Se
+                             None => Action::Load,
+                         };
+                         let old_id = editor.document_id_by_path(&file);
+-                        let doc_id = match editor.open(&file, action) {
++                        match editor.open(&file, action) {
+                             // Ignore irregular files during application init.
+                             Err(DocumentOpenError::IrregularFile) => {
+                                 nr_of_files -= 1;
+@@ -200,18 +236,20 @@ pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Se
+                             // We can't open more than 1 buffer for 1 file, in this case we already have opened this file previously
+                             Ok(doc_id) if old_id == Some(doc_id) => {
+                                 nr_of_files -= 1;
+-                                doc_id
+                             }
+-                            Ok(doc_id) => doc_id,
++                            Ok(_) => (),
+                         };
+                         // with Action::Load all documents have the same view
+                         // NOTE: this isn't necessarily true anymore. If
+                         // `--vsplit` or `--hsplit` are used, the file which is
+                         // opened last is focused on.
+-                        let view_id = editor.tree.focus;
+-                        let doc = doc_mut!(editor, &doc_id);
+-                        let pos = Selection::point(pos_at_coords(doc.text().slice(..), pos, true));
+-                        doc.set_selection(view_id, pos);
++                        if let Some(pos) = pos {
++                            let (view, doc) = current!(editor);
++                            let pos =
++                                Selection::point(pos_at_coords(doc.text().slice(..), pos, true));
++                            doc.set_selection(view.id, pos);
++                            align_view(doc, view, Align::Center);
++                        }
+                     }
+                 }
+ 
+@@ -224,10 +262,6 @@ pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Se
+                         nr_of_files,
+                         if nr_of_files == 1 { "" } else { "s" } // avoid "Loaded 1 files." grammo
+                     ));
+-                    // align the view to center after all files are loaded,
+-                    // does not affect views without pos since it is at the top
+-                    let (view, doc) = current!(editor);
+-                    align_view(doc, view, Align::Center);
+                 }
+             } else {
+                 editor.new_file(Action::VerticalSplit);
+@@ -254,6 +288,38 @@ pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Se
+         ])
+         .context("build signal handler")?;
+ 
++        let jobs = Jobs::new();
++        if persistence_config.old_files {
++            let file_trim = persistence_config.old_files_trim;
++            jobs.add(
++                Job::new(async move {
++                    persistence::trim_file_history(file_trim);
++                    Ok(())
++                })
++                .wait_before_exiting(),
++            );
++        }
++        if persistence_config.commands {
++            let commands_trim = persistence_config.commands_trim;
++            jobs.add(
++                Job::new(async move {
++                    persistence::trim_command_history(commands_trim);
++                    Ok(())
++                })
++                .wait_before_exiting(),
++            );
++        }
++        if persistence_config.search {
++            let search_trim = persistence_config.search_trim;
++            jobs.add(
++                Job::new(async move {
++                    persistence::trim_search_history(search_trim);
++                    Ok(())
++                })
++                .wait_before_exiting(),
++            );
++        }
++
+         let app = Self {
+             compositor,
+             terminal,
+@@ -265,7 +331,7 @@ pub fn new(args: Args, config: Config, lang_loader: syntax::Loader) -> Result<Se
+             syn_loader,
+ 
+             signals,
+-            jobs: Jobs::new(),
++            jobs,
+             lsp_progress: LspProgressMap::new(),
+         };
+ 
+diff --git a/helix-term/src/args.rs b/helix-term/src/args.rs
+index 853c1576..31002251 100644
+--- a/helix-term/src/args.rs
++++ b/helix-term/src/args.rs
+@@ -16,7 +16,7 @@ pub struct Args {
+     pub verbosity: u64,
+     pub log_file: Option<PathBuf>,
+     pub config_file: Option<PathBuf>,
+-    pub files: Vec<(PathBuf, Position)>,
++    pub files: Vec<(PathBuf, Option<Position>)>,
+     pub working_directory: Option<PathBuf>,
+ }
+ 
+@@ -106,7 +106,10 @@ pub fn parse_args() -> Result<Args> {
+ 
+         if let Some(file) = args.files.first_mut() {
+             if line_number != 0 {
+-                file.1.row = line_number;
++                file.1 = match file.1 {
++                    Some(pos) => Some(Position::new(line_number, pos.col)),
++                    None => Some(Position::new(line_number, 0)),
++                }
+             }
+         }
+ 
+@@ -115,8 +118,8 @@ pub fn parse_args() -> Result<Args> {
+ }
+ 
+ /// Parse arg into [`PathBuf`] and position.
+-pub(crate) fn parse_file(s: &str) -> (PathBuf, Position) {
+-    let def = || (PathBuf::from(s), Position::default());
++pub(crate) fn parse_file(s: &str) -> (PathBuf, Option<Position>) {
++    let def = || (PathBuf::from(s), None);
+     if Path::new(s).exists() {
+         return def();
+     }
+@@ -128,22 +131,22 @@ pub(crate) fn parse_file(s: &str) -> (PathBuf, Position) {
+ /// Split file.rs:10:2 into [`PathBuf`], row and col.
+ ///
+ /// Does not validate if file.rs is a file or directory.
+-fn split_path_row_col(s: &str) -> Option<(PathBuf, Position)> {
++fn split_path_row_col(s: &str) -> Option<(PathBuf, Option<Position>)> {
+     let mut s = s.trim_end_matches(':').rsplitn(3, ':');
+     let col: usize = s.next()?.parse().ok()?;
+     let row: usize = s.next()?.parse().ok()?;
+     let path = s.next()?.into();
+     let pos = Position::new(row.saturating_sub(1), col.saturating_sub(1));
+-    Some((path, pos))
++    Some((path, Some(pos)))
+ }
+ 
+ /// Split file.rs:10 into [`PathBuf`] and row.
+ ///
+ /// Does not validate if file.rs is a file or directory.
+-fn split_path_row(s: &str) -> Option<(PathBuf, Position)> {
++fn split_path_row(s: &str) -> Option<(PathBuf, Option<Position>)> {
+     let (path, row) = s.trim_end_matches(':').rsplit_once(':')?;
+     let row: usize = row.parse().ok()?;
+     let path = path.into();
+     let pos = Position::new(row.saturating_sub(1), 0);
+-    Some((path, pos))
++    Some((path, Some(pos)))
+ }
+diff --git a/helix-term/src/commands.rs b/helix-term/src/commands.rs
+index 891974d0..a06083a3 100644
+--- a/helix-term/src/commands.rs
++++ b/helix-term/src/commands.rs
+@@ -44,6 +44,7 @@
+     info::Info,
+     input::KeyEvent,
+     keyboard::KeyCode,
++    persistence,
+     theme::Style,
+     tree,
+     view::View,
+@@ -4403,6 +4404,10 @@ fn yank_impl(editor: &mut Editor, register: char) {
+         .collect();
+     let selections = values.len();
+ 
++    if editor.config().persistence.clipboard {
++        persistence::write_clipboard_file(&values);
++    }
++
+     match editor.registers.write(register, values) {
+         Ok(_) => editor.set_status(format!(
+             "yanked {selections} selection{} to register {register}",
+diff --git a/helix-term/src/commands/typed.rs b/helix-term/src/commands/typed.rs
+index d40bf8be..af0dd18e 100644
+--- a/helix-term/src/commands/typed.rs
++++ b/helix-term/src/commands/typed.rs
+@@ -130,10 +130,11 @@ fn open(cx: &mut compositor::Context, args: &[Cow<str>], event: PromptEvent) ->
+             // Otherwise, just open the file
+             let _ = cx.editor.open(&path, Action::Replace)?;
+             let (view, doc) = current!(cx.editor);
+-            let pos = Selection::point(pos_at_coords(doc.text().slice(..), pos, true));
+-            doc.set_selection(view.id, pos);
+-            // does not affect opening a buffer without pos
+-            align_view(doc, view, Align::Center);
++            if let Some(pos) = pos {
++                let pos = Selection::point(pos_at_coords(doc.text().slice(..), pos, true));
++                doc.set_selection(view.id, pos);
++                align_view(doc, view, Align::Center);
++            }
+         }
+     }
+     Ok(())
+@@ -2540,6 +2541,65 @@ fn read(cx: &mut compositor::Context, args: &[Cow<str>], event: PromptEvent) ->
+     Ok(())
+ }
+ 
++fn reload_history(
++    cx: &mut compositor::Context,
++    _args: &[Cow<str>],
++    event: PromptEvent,
++) -> anyhow::Result<()> {
++    if event != PromptEvent::Validate {
++        return Ok(());
++    }
++
++    if cx.editor.config().persistence.old_files {
++        cx.editor.old_file_locs = HashMap::from_iter(
++            persistence::read_file_history()
++                .into_iter()
++                .map(|entry| (entry.path.clone(), (entry.view_position, entry.selection))),
++        );
++        let file_trim = cx.editor.config().persistence.old_files_trim;
++        cx.jobs.add(
++            Job::new(async move {
++                persistence::trim_file_history(file_trim);
++                Ok(())
++            })
++            .wait_before_exiting(),
++        );
++    }
++    if cx.editor.config().persistence.commands {
++        cx.editor
++            .registers
++            .write(':', persistence::read_command_history())?;
++        let commands_trim = cx.editor.config().persistence.commands_trim;
++        cx.jobs.add(
++            Job::new(async move {
++                persistence::trim_command_history(commands_trim);
++                Ok(())
++            })
++            .wait_before_exiting(),
++        );
++    }
++    if cx.editor.config().persistence.search {
++        cx.editor
++            .registers
++            .write('/', persistence::read_search_history())?;
++        let search_trim = cx.editor.config().persistence.search_trim;
++        cx.jobs.add(
++            Job::new(async move {
++                persistence::trim_search_history(search_trim);
++                Ok(())
++            })
++            .wait_before_exiting(),
++        );
++    }
++    if cx.editor.config().persistence.clipboard {
++        cx.editor
++            .registers
++            .write('"', persistence::read_clipboard_file())?;
++    }
++
++    Ok(())
++}
++
+ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
+     TypableCommand {
+         name: "quit",
+@@ -3161,6 +3221,13 @@ fn read(cx: &mut compositor::Context, args: &[Cow<str>], event: PromptEvent) ->
+         fun: read,
+         signature: CommandSignature::positional(&[completers::filename]),
+     },
++    TypableCommand {
++        name: "reload-history",
++        aliases: &[],
++        doc: "Reload history files for persistent state",
++        fun: reload_history,
++        signature: CommandSignature::none(),
++    },
+ ];
+ 
+ pub static TYPABLE_COMMAND_MAP: Lazy<HashMap<&'static str, &'static TypableCommand>> =
+diff --git a/helix-term/src/main.rs b/helix-term/src/main.rs
+index 385a0406..dcc49119 100644
+--- a/helix-term/src/main.rs
++++ b/helix-term/src/main.rs
+@@ -44,6 +44,10 @@ async fn main_impl() -> Result<i32> {
+ 
+     helix_loader::initialize_config_file(args.config_file.clone());
+     helix_loader::initialize_log_file(args.log_file.clone());
++    helix_loader::initialize_command_histfile(None);
++    helix_loader::initialize_search_histfile(None);
++    helix_loader::initialize_file_histfile(None);
++    helix_loader::initialize_clipboard_file(None);
+ 
+     // Help has a higher priority and should be handled separately.
+     if args.display_help {
+diff --git a/helix-term/src/ui/prompt.rs b/helix-term/src/ui/prompt.rs
+index f44020c5..5473575f 100644
+--- a/helix-term/src/ui/prompt.rs
++++ b/helix-term/src/ui/prompt.rs
+@@ -16,7 +16,7 @@
+ };
+ use helix_view::{
+     graphics::{CursorKind, Margin, Rect},
+-    Editor,
++    persistence, Editor,
+ };
+ 
+ type PromptCharHandler = Box<dyn Fn(&mut Prompt, char, &Context)>;
+@@ -613,6 +613,11 @@ fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
+                                 {
+                                     cx.editor.set_error(err.to_string());
+                                 }
++                                if (cx.editor.config().persistence.commands && register == ':')
++                                    || (cx.editor.config().persistence.search && register == '/')
++                                {
++                                    persistence::push_reg_history(register, &self.line);
++                                }
+                             };
+                         }
+ 
+diff --git a/helix-term/tests/integration.rs b/helix-term/tests/integration.rs
+index 35214bcb..6d5b3caa 100644
+--- a/helix-term/tests/integration.rs
++++ b/helix-term/tests/integration.rs
+@@ -20,6 +20,7 @@ async fn hello_world() -> anyhow::Result<()> {
+     mod commands;
+     mod languages;
+     mod movement;
++    mod persistence;
+     mod prompt;
+     mod splits;
+ }
+diff --git a/helix-term/tests/test/helpers.rs b/helix-term/tests/test/helpers.rs
+index 70b3f402..be39caed 100644
+--- a/helix-term/tests/test/helpers.rs
++++ b/helix-term/tests/test/helpers.rs
+@@ -8,6 +8,7 @@
+ use anyhow::bail;
+ use crossterm::event::{Event, KeyEvent};
+ use helix_core::{diagnostic::Severity, test, Selection, Transaction};
++use helix_loader;
+ use helix_term::{application::Application, args::Args, config::Config, keymap::merge_keys};
+ use helix_view::{current_ref, doc, editor::LspConfig, input::parse_macro, Editor};
+ use tempfile::NamedTempFile;
+@@ -345,7 +346,7 @@ pub fn with_file<P: Into<PathBuf>>(
+         path: P,
+         pos: Option<helix_core::Position>,
+     ) -> Self {
+-        self.args.files.push((path.into(), pos.unwrap_or_default()));
++        self.args.files.push((path.into(), pos));
+         self
+     }
+ 
+diff --git a/helix-term/tests/test/persistence.rs b/helix-term/tests/test/persistence.rs
+new file mode 100644
+index 00000000..94cdad3c
+--- /dev/null
++++ b/helix-term/tests/test/persistence.rs
+@@ -0,0 +1,138 @@
++use super::*;
++use helix_term::{config::Config, keymap};
++use helix_view::editor;
++use std::{fs::File, io::Read};
++use tempfile::{NamedTempFile, TempPath};
++
++fn init_persistence_files() -> anyhow::Result<(TempPath, TempPath, TempPath, TempPath)> {
++    let command_file = NamedTempFile::new()?;
++    let command_path = command_file.into_temp_path();
++    helix_loader::initialize_command_histfile(Some(command_path.to_path_buf()));
++
++    let search_file = NamedTempFile::new()?;
++    let search_path = search_file.into_temp_path();
++    helix_loader::initialize_search_histfile(Some(search_path.to_path_buf()));
++
++    let file_file = NamedTempFile::new()?;
++    let file_path = file_file.into_temp_path();
++    helix_loader::initialize_file_histfile(Some(file_path.to_path_buf()));
++
++    let clipboard_file = NamedTempFile::new()?;
++    let clipboard_path = clipboard_file.into_temp_path();
++    helix_loader::initialize_clipboard_file(Some(clipboard_path.to_path_buf()));
++
++    Ok((command_path, search_path, file_path, clipboard_path))
++}
++
++fn config_with_persistence() -> Config {
++    let mut editor_config = editor::Config::default();
++    editor_config.persistence.old_files = true;
++    editor_config.persistence.commands = true;
++    editor_config.persistence.search = true;
++    editor_config.persistence.clipboard = true;
++    editor_config.persistence.search_trim = 3;
++
++    Config {
++        theme: None,
++        keys: keymap::default(),
++        editor: editor_config,
++    }
++}
++
++#[tokio::test(flavor = "multi_thread")]
++async fn test_persistence() -> anyhow::Result<()> {
++    let (_, search_histfile_path, _, _) = init_persistence_files()?;
++    let mut file = tempfile::NamedTempFile::new()?;
++
++    // Session 1:
++    // open a new file,
++    // add a newline, then a,
++    // write-quit
++    test_key_sequence(
++        &mut helpers::AppBuilder::new()
++            .with_config(config_with_persistence())
++            .with_file(file.path(), None)
++            .build()?,
++        Some("oa<esc>:wq<ret>"),
++        None,
++        true,
++    )
++    .await?;
++
++    // Sanity check contents of file after first session
++    helpers::assert_file_has_content(&mut file, &LineFeedHandling::Native.apply("\na\n"))?;
++
++    // Session 2:
++    // open same file,
++    // add newline, then b,
++    // copy the line ("b\n")
++    // search for "a"
++    // go back down to b
++    // use last command (write-quit)
++    test_key_sequence(
++        &mut helpers::AppBuilder::new()
++            .with_config(config_with_persistence())
++            .with_file(file.path(), None)
++            .build()?,
++        Some("ob<esc>xy/a<ret>j:<up><ret>"),
++        None,
++        true,
++    )
++    .await?;
++
++    // This verifies both that the file position was persisted (since the b is inserted after the
++    // a), and the command history (":<up>" resolves to the ":wq" from session 1)
++    helpers::assert_file_has_content(&mut file, &LineFeedHandling::Native.apply("\na\nb\n"))?;
++
++    // Session 3:
++    // open same file,
++    // paste
++    // use last search ("/a")
++    // append a
++    // search for "1", "2", and "3" in sequence.
++    // use last command (write-quit)
++    test_key_sequence(
++        &mut helpers::AppBuilder::new()
++            .with_config(config_with_persistence())
++            .with_file(file.path(), None)
++            .build()?,
++        Some("p/<up><ret>aa<esc>/1<ret>/2<ret>/3<ret>:<up><ret>"),
++        None,
++        true,
++    )
++    .await?;
++
++    // This verifies search history was persisted ("/<up>" resolves to "/a" from session 2), and
++    // the clipboard was persisted (paste pastes the "b\n" copied in session 2)
++    helpers::assert_file_has_content(&mut file, &LineFeedHandling::Native.apply("\naa\nb\nb\n"))?;
++
++    // Session 4:
++    // open same file
++    // use last command (write-quit)
++    test_key_sequence(
++        &mut helpers::AppBuilder::new()
++            .with_config(config_with_persistence())
++            .with_file(file.path(), None)
++            .build()?,
++        Some(":<up><ret>"),
++        None,
++        true,
++    )
++    .await?;
++
++    // NOTE: This time we check the search history file, instead of the edited file
++    let mut search_histfile = File::open(search_histfile_path)?;
++    let mut search_histfile_contents = String::new();
++    search_histfile.read_to_string(&mut search_histfile_contents)?;
++    // This verifies that trimming the persistent state files is working correctly, because
++    // session 3 sent more searches (4: "/a", "/1", "/2", "/3") than the trim limit (3), so when
++    // session 4 starts, it should perform a trim, removing the oldest entry ("/a") while leaving
++    // the other 3 intact.
++    // The weird looking format of the string is because persistence data is encoded using bincode.
++    assert_eq!(
++        search_histfile_contents,
++        "\u{1}\0\0\0\0\0\0\01\u{1}\0\0\0\0\0\0\02\u{1}\0\0\0\0\0\0\03"
++    );
++
++    Ok(())
++}
+diff --git a/helix-view/Cargo.toml b/helix-view/Cargo.toml
+index b40f2589..8f4788fe 100644
+--- a/helix-view/Cargo.toml
++++ b/helix-view/Cargo.toml
+@@ -46,9 +46,12 @@ chardetng = "0.1"
+ 
+ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
++serde_regex = "1.1.0"
+ toml = "0.8"
+ log = "~0.4"
+ 
++regex.workspace = true
++
+ parking_lot = "0.12.3"
+ thiserror.workspace = true
+ 
+diff --git a/helix-view/src/editor.rs b/helix-view/src/editor.rs
+index 7eebe862..c2cb1507 100644
+--- a/helix-view/src/editor.rs
++++ b/helix-view/src/editor.rs
+@@ -9,9 +9,12 @@
+     handlers::Handlers,
+     info::Info,
+     input::KeyEvent,
++    persistence::{self, FileHistoryEntry},
++    regex::EqRegex,
+     register::Registers,
+     theme::{self, Theme},
+     tree::{self, Tree},
++    view::ViewPosition,
+     Document, DocumentId, View, ViewId,
+ };
+ use dap::StackFrame;
+@@ -59,6 +62,8 @@
+     ArcSwap,
+ };
+ 
++use regex::Regex;
++
+ pub const DEFAULT_AUTO_SAVE_DELAY: u64 = 3000;
+ 
+ fn deserialize_duration_millis<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+@@ -362,6 +367,7 @@ pub struct Config {
+     pub end_of_line_diagnostics: DiagnosticFilter,
+     // Set to override the default clipboard provider
+     pub clipboard_provider: ClipboardProvider,
++    pub persistence: PersistenceConfig,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Eq, PartialOrd, Ord)]
+@@ -990,6 +996,38 @@ pub enum PopupBorderConfig {
+     Menu,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
++pub struct PersistenceConfig {
++    pub old_files: bool,
++    pub commands: bool,
++    pub search: bool,
++    pub clipboard: bool,
++    pub old_files_exclusions: Vec<EqRegex>,
++    pub old_files_trim: usize,
++    pub commands_trim: usize,
++    pub search_trim: usize,
++}
++
++impl Default for PersistenceConfig {
++    fn default() -> Self {
++        Self {
++            old_files: false,
++            commands: false,
++            search: false,
++            clipboard: false,
++            // TODO: any more defaults we should add here?
++            old_files_exclusions: [r".*/\.git/.*", r".*/COMMIT_EDITMSG"]
++                .iter()
++                .map(|s| Regex::new(s).unwrap().into())
++                .collect(),
++            old_files_trim: 100,
++            commands_trim: 100,
++            search_trim: 100,
++        }
++    }
++}
++
+ impl Default for Config {
+     fn default() -> Self {
+         Self {
+@@ -1048,6 +1086,7 @@ fn default() -> Self {
+             inline_diagnostics: InlineDiagnosticsConfig::default(),
+             end_of_line_diagnostics: DiagnosticFilter::Disable,
+             clipboard_provider: ClipboardProvider::default(),
++            persistence: PersistenceConfig::default(),
+         }
+     }
+ }
+@@ -1102,6 +1141,8 @@ pub struct Editor {
+     pub debugger_events: SelectAll<UnboundedReceiverStream<dap::Payload>>,
+     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
+ 
++    pub old_file_locs: HashMap<PathBuf, (ViewPosition, Selection)>,
++
+     pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
+     pub theme_loader: Arc<theme::Loader>,
+     /// last_theme is used for theme previews. We store the current theme here,
+@@ -1220,6 +1261,7 @@ pub fn new(
+         syn_loader: Arc<ArcSwap<syntax::Loader>>,
+         config: Arc<dyn DynAccess<Config>>,
+         handlers: Handlers,
++        old_file_locs: HashMap<PathBuf, (ViewPosition, Selection)>,
+     ) -> Self {
+         let language_servers = helix_lsp::Registry::new(syn_loader.clone());
+         let conf = config.load();
+@@ -1247,6 +1289,7 @@ pub fn new(
+             debugger: None,
+             debugger_events: SelectAll::new(),
+             breakpoints: HashMap::new(),
++            old_file_locs,
+             syn_loader,
+             theme_loader,
+             last_theme: None,
+@@ -1617,6 +1660,7 @@ fn _refresh(&mut self) {
+     fn replace_document_in_view(&mut self, current_view: ViewId, doc_id: DocumentId) {
+         let scrolloff = self.config().scrolloff;
+         let view = self.tree.get_mut(current_view);
++        view.doc = doc_id;
+ 
+         view.doc = doc_id;
+         let doc = doc_mut!(self, &doc_id);
+@@ -1722,6 +1766,7 @@ pub fn switch(&mut self, id: DocumentId, action: Action) {
+                 );
+                 // initialize selection for view
+                 let doc = doc_mut!(self, &id);
++
+                 doc.ensure_view_init(view_id);
+                 doc.mark_as_focused();
+                 focus_lost
+@@ -1793,8 +1838,8 @@ pub fn open(&mut self, path: &Path, action: Action) -> Result<DocumentId, Docume
+         let path = helix_stdx::path::canonicalize(path);
+         let id = self.document_id_by_path(&path);
+ 
+-        let id = if let Some(id) = id {
+-            id
++        let (id, new_doc) = if let Some(id) = id {
++            (id, false)
+         } else {
+             let mut doc = Document::open(
+                 &path,
+@@ -1815,18 +1860,73 @@ pub fn open(&mut self, path: &Path, action: Action) -> Result<DocumentId, Docume
+             let id = self.new_document(doc);
+             self.launch_language_servers(id);
+ 
+-            id
++            (id, true)
+         };
+ 
+         self.switch(id, action);
++
++        // Restore file position
++        // This needs to happen after the call to switch, since switch messes with view offsets
++        if new_doc
++            && !self
++                .config()
++                .persistence
++                .old_files_exclusions
++                .iter()
++                .any(|r| r.is_match(&path.to_string_lossy()))
++        {
++            if let Some((view_position, selection)) =
++                self.old_file_locs.get(&path).map(|x| x.to_owned())
++            {
++                let (view, doc) = current!(self);
++
++                let doc_len = doc.text().len_chars();
++                // Don't restore the view and selection if the selection goes beyond the file's end
++                if !selection.ranges().iter().any(|range| range.to() > doc_len) {
++                    doc.set_view_offset(view.id, view_position);
++                    doc.set_selection(view.id, selection);
++                }
++            }
++        }
++
+         Ok(id)
+     }
+ 
+     pub fn close(&mut self, id: ViewId) {
+-        // Remove selections for the closed view on all documents.
++        let mut file_locs = Vec::new();
++
+         for doc in self.documents_mut() {
++            // Persist file location history for this view
++            if doc.selections().contains_key(&id) {
++                if let Some(path) = doc.path() {
++                    file_locs.push(FileHistoryEntry::new(
++                        path.clone(),
++                        doc.view_offset(id),
++                        doc.selection(id).clone(),
++                    ));
++                }
++            }
++
++            // Remove selections for the closed view on all documents.
+             doc.remove_view(id);
+         }
++
++        if self.config().persistence.old_files {
++            for loc in file_locs {
++                if !self
++                    .config()
++                    .persistence
++                    .old_files_exclusions
++                    .iter()
++                    .any(|r| r.is_match(&loc.path.to_string_lossy()))
++                {
++                    persistence::push_file_history(&loc);
++                    self.old_file_locs
++                        .insert(loc.path, (loc.view_position, loc.selection));
++                }
++            }
++        }
++
+         self.tree.remove(id);
+         self._refresh();
+     }
+@@ -1848,11 +1948,14 @@ pub fn close_document(&mut self, doc_id: DocumentId, force: bool) -> Result<(),
+             tokio::spawn(language_server.text_document_did_close(doc.identifier()));
+         }
+ 
++        #[derive(Debug)]
+         enum Action {
+             Close(ViewId),
+             ReplaceDoc(ViewId, DocumentId),
+         }
+ 
++        let mut file_locs = Vec::new();
++
+         let actions: Vec<Action> = self
+             .tree
+             .views_mut()
+@@ -1860,6 +1963,14 @@ enum Action {
+                 view.remove_document(&doc_id);
+ 
+                 if view.doc == doc_id {
++                    if let Some(path) = doc.path() {
++                        file_locs.push(FileHistoryEntry::new(
++                            path.clone(),
++                            doc.view_offset(view.id),
++                            doc.selection(view.id).clone(),
++                        ));
++                    };
++
+                     // something was previously open in the view, switch to previous doc
+                     if let Some(prev_doc) = view.docs_access_history.pop() {
+                         Some(Action::ReplaceDoc(view.id, prev_doc))
+@@ -1873,6 +1984,22 @@ enum Action {
+             })
+             .collect();
+ 
++        if self.config().persistence.old_files {
++            for loc in file_locs {
++                if !self
++                    .config()
++                    .persistence
++                    .old_files_exclusions
++                    .iter()
++                    .any(|r| r.is_match(&loc.path.to_string_lossy()))
++                {
++                    persistence::push_file_history(&loc);
++                    self.old_file_locs
++                        .insert(loc.path, (loc.view_position, loc.selection));
++                }
++            }
++        }
++
+         for action in actions {
+             match action {
+                 Action::Close(view_id) => {
+diff --git a/helix-view/src/lib.rs b/helix-view/src/lib.rs
+index d54b49ef..61955dcf 100644
+--- a/helix-view/src/lib.rs
++++ b/helix-view/src/lib.rs
+@@ -13,6 +13,8 @@
+ pub mod info;
+ pub mod input;
+ pub mod keyboard;
++pub mod persistence;
++pub mod regex;
+ pub mod register;
+ pub mod theme;
+ pub mod tree;
+diff --git a/helix-view/src/persistence.rs b/helix-view/src/persistence.rs
+new file mode 100644
+index 00000000..754b08aa
+--- /dev/null
++++ b/helix-view/src/persistence.rs
+@@ -0,0 +1,81 @@
++use helix_core::Selection;
++use helix_loader::{
++    clipboard_file, command_histfile, file_histfile,
++    persistence::{push_history, read_history, trim_history, write_history},
++    search_histfile,
++};
++use serde::{Deserialize, Serialize};
++use std::path::PathBuf;
++
++use crate::view::ViewPosition;
++
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub struct FileHistoryEntry {
++    pub path: PathBuf,
++    pub view_position: ViewPosition,
++    pub selection: Selection,
++}
++
++impl FileHistoryEntry {
++    pub fn new(path: PathBuf, view_position: ViewPosition, selection: Selection) -> Self {
++        Self {
++            path,
++            view_position,
++            selection,
++        }
++    }
++}
++
++pub fn push_file_history(entry: &FileHistoryEntry) {
++    push_history(file_histfile(), entry)
++}
++
++pub fn read_file_history() -> Vec<FileHistoryEntry> {
++    read_history(&file_histfile())
++}
++
++pub fn trim_file_history(limit: usize) {
++    trim_history::<FileHistoryEntry>(file_histfile(), limit)
++}
++
++pub fn push_reg_history(register: char, line: &String) {
++    let filepath = match register {
++        ':' => command_histfile(),
++        '/' => search_histfile(),
++        _ => return,
++    };
++
++    push_history(filepath, line)
++}
++
++fn read_reg_history(filepath: PathBuf) -> Vec<String> {
++    read_history(&filepath)
++}
++
++pub fn read_command_history() -> Vec<String> {
++    let mut hist = read_reg_history(command_histfile());
++    hist.reverse();
++    hist
++}
++
++pub fn trim_command_history(limit: usize) {
++    trim_history::<String>(command_histfile(), limit)
++}
++
++pub fn read_search_history() -> Vec<String> {
++    let mut hist = read_reg_history(search_histfile());
++    hist.reverse();
++    hist
++}
++
++pub fn trim_search_history(limit: usize) {
++    trim_history::<String>(search_histfile(), limit)
++}
++
++pub fn write_clipboard_file(values: &Vec<String>) {
++    write_history(clipboard_file(), values)
++}
++
++pub fn read_clipboard_file() -> Vec<String> {
++    read_history(&clipboard_file())
++}
+diff --git a/helix-view/src/regex.rs b/helix-view/src/regex.rs
+new file mode 100644
+index 00000000..8a491a3d
+--- /dev/null
++++ b/helix-view/src/regex.rs
+@@ -0,0 +1,37 @@
++use regex::Regex;
++use serde::{Deserialize, Serialize};
++use std::{
++    cmp::{Eq, PartialEq},
++    ops::Deref,
++};
++
++/// Wrapper type for regex::Regex that only exists so we can implement Eq on it, as that's needed
++/// to put it in editor::Config
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(transparent)]
++pub struct EqRegex {
++    #[serde(with = "serde_regex")]
++    inner: Regex,
++}
++
++impl From<Regex> for EqRegex {
++    fn from(value: Regex) -> Self {
++        EqRegex { inner: value }
++    }
++}
++
++impl Deref for EqRegex {
++    type Target = Regex;
++
++    fn deref(&self) -> &Self::Target {
++        &self.inner
++    }
++}
++
++impl PartialEq for EqRegex {
++    fn eq(&self, other: &Self) -> bool {
++        self.as_str() == other.as_str()
++    }
++}
++
++impl Eq for EqRegex {}
+diff --git a/helix-view/src/view.rs b/helix-view/src/view.rs
+index a229f01e..4f8387a8 100644
+--- a/helix-view/src/view.rs
++++ b/helix-view/src/view.rs
+@@ -17,6 +17,7 @@
+     Transaction,
+     VisualOffsetError::{PosAfterMaxRow, PosBeforeAnchorRow},
+ };
++use serde::{Deserialize, Serialize};
+ 
+ use std::{
+     collections::{HashMap, VecDeque},
+@@ -118,7 +119,7 @@ fn apply(&mut self, transaction: &Transaction, doc: &Document) {
+     }
+ }
+ 
+-#[derive(Clone, Debug, PartialEq, Eq, Copy, Default)]
++#[derive(Clone, Debug, PartialEq, Eq, Copy, Default, Serialize, Deserialize)]
+ pub struct ViewPosition {
+     pub anchor: usize,
+     pub horizontal_offset: usize,
+-- 
+2.47.1
+

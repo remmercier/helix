@@ -1,0 +1,703 @@
+From 27ad68f5e98c2b219488f7eeedb6c7667304446d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?R=C3=A9mi=20Mercier?= <rem.mercier@gmail.com>
+Date: Sat, 18 Jan 2025 14:00:39 -0500
+Subject: [PATCH] merge 2-12308/textDocument/documentColor
+
+---
+ book/src/editor.md                            |   1 +
+ helix-core/src/syntax.rs                      |   2 +
+ helix-lsp/src/client.rs                       |  20 +++
+ helix-term/src/commands/lsp.rs                | 145 +++++++++++++++---
+ helix-term/src/ui/document.rs                 |   6 +-
+ helix-term/src/ui/editor.rs                   |   9 +-
+ helix-term/src/ui/text_decorations.rs         |  47 +++++-
+ .../src/ui/text_decorations/diagnostics.rs    |   1 +
+ helix-view/src/document.rs                    | 115 +++++++++++++-
+ helix-view/src/editor.rs                      |   3 +
+ helix-view/src/view.rs                        |  13 +-
+ 11 files changed, 323 insertions(+), 39 deletions(-)
+
+diff --git a/book/src/editor.md b/book/src/editor.md
+index 4d144d6d..f7eea3b8 100644
+--- a/book/src/editor.md
++++ b/book/src/editor.md
+@@ -150,6 +150,7 @@ ### `[editor.lsp]` Section
+ | `display-progress-messages` | Display LSP progress messages below statusline[^1]    | `false` |
+ | `auto-signature-help` | Enable automatic popup of signature help (parameter hints)  | `true`  |
+ | `display-inlay-hints` | Display inlay hints[^2]                                     | `false` |
++| `display-color-swatches` | Shows color swatches next to colors | `true` |
+ | `display-signature-help-docs` | Display docs under signature help popup             | `true`  |
+ | `snippets`      | Enables snippet completions. Requires a server restart (`:lsp-restart`) to take effect after `:config-reload`/`:set`. | `true`  |
+ | `goto-reference-include-declaration` | Include declaration in the goto references popup. | `true`  |
+diff --git a/helix-core/src/syntax.rs b/helix-core/src/syntax.rs
+index 2488d337..754c2310 100644
+--- a/helix-core/src/syntax.rs
++++ b/helix-core/src/syntax.rs
+@@ -338,6 +338,7 @@ pub enum LanguageServerFeature {
+     Diagnostics,
+     RenameSymbol,
+     InlayHints,
++    ColorProvider,
+ }
+ 
+ impl Display for LanguageServerFeature {
+@@ -361,6 +362,7 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             Diagnostics => "diagnostics",
+             RenameSymbol => "rename-symbol",
+             InlayHints => "inlay-hints",
++            ColorProvider => "color-provider",
+         };
+         write!(f, "{feature}",)
+     }
+diff --git a/helix-lsp/src/client.rs b/helix-lsp/src/client.rs
+index cc1c4ce8..27b51cd7 100644
+--- a/helix-lsp/src/client.rs
++++ b/helix-lsp/src/client.rs
+@@ -353,6 +353,7 @@ pub fn supports_feature(&self, feature: LanguageServerFeature) -> bool {
+                 capabilities.inlay_hint_provider,
+                 Some(OneOf::Left(true) | OneOf::Right(InlayHintServerCapabilities::Options(_)))
+             ),
++            LanguageServerFeature::ColorProvider => capabilities.color_provider.is_some(),
+         }
+     }
+ 
+@@ -1114,6 +1115,25 @@ pub fn text_document_range_inlay_hints(
+         Some(self.call::<lsp::request::InlayHintRequest>(params))
+     }
+ 
++    pub fn text_document_color_swatches(
++        &self,
++        text_document: lsp::TextDocumentIdentifier,
++        work_done_token: Option<lsp::ProgressToken>,
++    ) -> Option<impl Future<Output = Result<Value>>> {
++        self.capabilities.get().unwrap().color_provider.as_ref()?;
++        let params = lsp::DocumentColorParams {
++            text_document,
++            work_done_progress_params: lsp::WorkDoneProgressParams {
++                work_done_token: work_done_token.clone(),
++            },
++            partial_result_params: helix_lsp_types::PartialResultParams {
++                partial_result_token: work_done_token,
++            },
++        };
++
++        Some(self.call::<lsp::request::DocumentColor>(params))
++    }
++
+     pub fn text_document_hover(
+         &self,
+         text_document: lsp::TextDocumentIdentifier,
+diff --git a/helix-term/src/commands/lsp.rs b/helix-term/src/commands/lsp.rs
+index 39855688..1a767c8f 100644
+--- a/helix-term/src/commands/lsp.rs
++++ b/helix-term/src/commands/lsp.rs
+@@ -18,10 +18,10 @@
+ };
+ use helix_stdx::path;
+ use helix_view::{
+-    document::{DocumentInlayHints, DocumentInlayHintsId},
++    document::{ColorSwatchesId, DocumentColorSwatches, DocumentInlayHints, DocumentInlayHintsId},
+     editor::Action,
+     handlers::lsp::SignatureHelpInvoked,
+-    theme::Style,
++    theme::{Color, Style},
+     Document, View,
+ };
+ 
+@@ -1249,18 +1249,29 @@ pub fn select_references_to_symbol_under_cursor(cx: &mut Context) {
+     );
+ }
+ 
+-pub fn compute_inlay_hints_for_all_views(editor: &mut Editor, jobs: &mut crate::job::Jobs) {
+-    if !editor.config().lsp.display_inlay_hints {
++pub fn compute_lsp_annotations_for_all_views(editor: &mut Editor, jobs: &mut crate::job::Jobs) {
++    let display_inlay_hints = editor.config().lsp.display_inlay_hints;
++    let display_color_swatches = editor.config().lsp.display_color_swatches;
++
++    if !display_inlay_hints && !display_color_swatches {
+         return;
+     }
+ 
+     for (view, _) in editor.tree.views() {
+-        let doc = match editor.documents.get(&view.doc) {
+-            Some(doc) => doc,
+-            None => continue,
++        let Some(doc) = editor.documents.get(&view.doc) else {
++            continue;
+         };
+-        if let Some(callback) = compute_inlay_hints_for_view(view, doc) {
+-            jobs.callback(callback);
++
++        if display_inlay_hints {
++            if let Some(callback) = compute_inlay_hints_for_view(view, doc) {
++                jobs.callback(callback);
++            }
++        }
++
++        if display_color_swatches {
++            if let Some(callback) = compute_color_swatches_for_view(view, doc) {
++                jobs.callback(callback);
++            }
+         }
+     }
+ }
+@@ -1276,20 +1287,7 @@ fn compute_inlay_hints_for_view(
+         .language_servers_with_feature(LanguageServerFeature::InlayHints)
+         .next()?;
+ 
+-    let doc_text = doc.text();
+-    let len_lines = doc_text.len_lines();
+-
+-    // Compute ~3 times the current view height of inlay hints, that way some scrolling
+-    // will not show half the view with hints and half without while still being faster
+-    // than computing all the hints for the full file (which could be dozens of time
+-    // longer than the view is).
+-    let view_height = view.inner_height();
+-    let first_visible_line =
+-        doc_text.char_to_line(doc.view_offset(view_id).anchor.min(doc_text.len_chars()));
+-    let first_line = first_visible_line.saturating_sub(view_height);
+-    let last_line = first_visible_line
+-        .saturating_add(view_height.saturating_mul(2))
+-        .min(len_lines);
++    let (first_line, last_line) = doc.inline_annotations_line_range(view.inner_height(), view.id);
+ 
+     let new_doc_inlay_hints_id = DocumentInlayHintsId {
+         first_line,
+@@ -1304,6 +1302,7 @@ fn compute_inlay_hints_for_view(
+         return None;
+     }
+ 
++    let doc_text = doc.text();
+     let doc_slice = doc_text.slice(..);
+     let first_char_in_range = doc_slice.line_to_char(first_line);
+     let last_char_in_range = doc_slice.line_to_char(last_line);
+@@ -1409,3 +1408,103 @@ fn compute_inlay_hints_for_view(
+ 
+     Some(callback)
+ }
++
++fn compute_color_swatches_for_view(
++    view: &View,
++    doc: &Document,
++) -> Option<std::pin::Pin<Box<impl Future<Output = Result<crate::job::Callback, anyhow::Error>>>>> {
++    let view_id = view.id;
++    let doc_id = view.doc;
++
++    let language_server = doc
++        .language_servers_with_feature(LanguageServerFeature::ColorProvider)
++        .next()?;
++
++    let (first_line, last_line) = doc.inline_annotations_line_range(view.inner_height(), view.id);
++
++    let new_doc_color_swatches_id = ColorSwatchesId {
++        first_line,
++        last_line,
++    };
++
++    // Don't recompute the color swatches in case nothing has changed about the view
++    if !doc.color_swatches_outdated
++        && doc
++            .color_swatches(view_id)
++            .map_or(false, |doc_color_swatches| {
++                doc_color_swatches.id == new_doc_color_swatches_id
++            })
++    {
++        return None;
++    }
++
++    let offset_encoding = language_server.offset_encoding();
++
++    let callback = super::make_job_callback(
++        language_server.text_document_color_swatches(doc.identifier(), None)?,
++        move |editor, _compositor, response: Option<Vec<lsp::ColorInformation>>| {
++            // The config was modified or the window was closed while the request was in flight
++            if !editor.config().lsp.display_color_swatches || editor.tree.try_get(view_id).is_none()
++            {
++                return;
++            }
++
++            // Add annotations to relevant document, not the current one (it may have changed in between)
++            let Some(doc) = editor.documents.get_mut(&doc_id) else {
++                return;
++            };
++
++            // If we have neither color swatches nor an LSP, empty the color swatches since they're now oudated
++            let mut swatches = match response {
++                Some(swatches) if !swatches.is_empty() => swatches,
++                _ => {
++                    doc.set_color_swatches(
++                        view_id,
++                        DocumentColorSwatches::empty_with_id(new_doc_color_swatches_id),
++                    );
++                    return;
++                }
++            };
++
++            // Most language servers will already send them sorted but ensure this is the case to avoid errors on our end.
++            swatches.sort_by_key(|swatch| swatch.range.start);
++
++            let swatch_count = swatches.len();
++
++            let mut color_swatches = Vec::with_capacity(swatch_count);
++            let mut color_swatches_padding = Vec::with_capacity(swatch_count);
++            let mut colors = Vec::with_capacity(swatch_count);
++
++            let doc_text = doc.text();
++
++            for swatch in swatches {
++                let Some(swatch_index) =
++                    helix_lsp::util::lsp_pos_to_pos(doc_text, swatch.range.start, offset_encoding)
++                else {
++                    // Skip color swatches that have no "real" position
++                    continue;
++                };
++
++                color_swatches.push(InlineAnnotation::new(swatch_index, "■"));
++                color_swatches_padding.push(InlineAnnotation::new(swatch_index, " "));
++                colors.push(Color::Rgb(
++                    (swatch.color.red * 255.) as u8,
++                    (swatch.color.green * 255.) as u8,
++                    (swatch.color.blue * 255.) as u8,
++                ));
++            }
++
++            doc.set_color_swatches(
++                view_id,
++                DocumentColorSwatches {
++                    id: new_doc_color_swatches_id,
++                    colors,
++                    color_swatches,
++                    color_swatches_padding,
++                },
++            );
++        },
++    );
++
++    Some(callback)
++}
+diff --git a/helix-term/src/ui/document.rs b/helix-term/src/ui/document.rs
+index d1a74e7e..c82ab6b7 100644
+--- a/helix-term/src/ui/document.rs
++++ b/helix-term/src/ui/document.rs
+@@ -216,7 +216,8 @@ pub fn render_text(
+                 .unwrap_or((Style::default(), usize::MAX));
+         }
+ 
+-        let grapheme_style = if let GraphemeSource::VirtualText { highlight } = grapheme.source {
++        let mut grapheme_style = if let GraphemeSource::VirtualText { highlight } = grapheme.source
++        {
+             let mut style = renderer.text_style;
+             if let Some(highlight) = highlight {
+                 style = style.patch(theme.highlight(highlight.0));
+@@ -231,7 +232,8 @@ pub fn render_text(
+                 overlay_style: overlay_style_span.0,
+             }
+         };
+-        decorations.decorate_grapheme(renderer, &grapheme);
++
++        decorations.decorate_grapheme(renderer, &grapheme, &mut grapheme_style.syntax_style);
+ 
+         let virt = grapheme.is_virtual();
+         let grapheme_width = renderer.draw_grapheme(
+diff --git a/helix-term/src/ui/editor.rs b/helix-term/src/ui/editor.rs
+index 37036f0a..dcf5a7c0 100644
+--- a/helix-term/src/ui/editor.rs
++++ b/helix-term/src/ui/editor.rs
+@@ -36,6 +36,7 @@
+ use tui::{buffer::Buffer as Surface, text::Span};
+ 
+ use super::context::{self, StickyNode};
++use super::text_decorations::ColorSwatch;
+ 
+ pub struct EditorView {
+     pub keymaps: Keymaps,
+@@ -208,7 +209,11 @@ pub fn render_view(
+             inline_diagnostic_config,
+             config.end_of_line_diagnostics,
+         ));
+-
++        if let Some(swatches) = doc.color_swatches(view.id) {
++            for (swatch, color) in swatches.color_swatches.iter().zip(swatches.colors.iter()) {
++                decorations.add_decoration(ColorSwatch::new(*color, swatch.char_idx));
++            }
++        }
+         render_document(
+             surface,
+             inner,
+@@ -1161,7 +1166,7 @@ pub fn clear_completion(&mut self, editor: &mut Editor) -> Option<OnKeyCallback>
+     }
+ 
+     pub fn handle_idle_timeout(&mut self, cx: &mut commands::Context) -> EventResult {
+-        commands::compute_inlay_hints_for_all_views(cx.editor, cx.jobs);
++        commands::compute_lsp_annotations_for_all_views(cx.editor, cx.jobs);
+ 
+         EventResult::Ignored(None)
+     }
+diff --git a/helix-term/src/ui/text_decorations.rs b/helix-term/src/ui/text_decorations.rs
+index 931ea431..92685c31 100644
+--- a/helix-term/src/ui/text_decorations.rs
++++ b/helix-term/src/ui/text_decorations.rs
+@@ -2,7 +2,10 @@
+ 
+ use helix_core::doc_formatter::FormattedGrapheme;
+ use helix_core::Position;
+-use helix_view::editor::CursorCache;
++use helix_view::{
++    editor::CursorCache,
++    theme::{Color, Style},
++};
+ 
+ use crate::ui::document::{LinePos, TextRenderer};
+ 
+@@ -81,6 +84,7 @@ fn decorate_grapheme(
+         &mut self,
+         _renderer: &mut TextRenderer,
+         _grapheme: &FormattedGrapheme,
++        _style: &mut Style,
+     ) -> usize {
+         usize::MAX
+     }
+@@ -108,7 +112,12 @@ pub fn prepare_for_rendering(&mut self, first_visible_char: usize) {
+         }
+     }
+ 
+-    pub fn decorate_grapheme(&mut self, renderer: &mut TextRenderer, grapheme: &FormattedGrapheme) {
++    pub fn decorate_grapheme(
++        &mut self,
++        renderer: &mut TextRenderer,
++        grapheme: &FormattedGrapheme,
++        style: &mut Style,
++    ) {
+         for (decoration, hook_char_idx) in &mut self.decorations {
+             loop {
+                 match (*hook_char_idx).cmp(&grapheme.char_idx) {
+@@ -117,7 +126,7 @@ pub fn decorate_grapheme(&mut self, renderer: &mut TextRenderer, grapheme: &Form
+                         *hook_char_idx = decoration.skip_concealed_anchor(grapheme.char_idx)
+                     }
+                     Ordering::Equal => {
+-                        *hook_char_idx = decoration.decorate_grapheme(renderer, grapheme)
++                        *hook_char_idx = decoration.decorate_grapheme(renderer, grapheme, style)
+                     }
+                     Ordering::Greater => break,
+                 }
+@@ -144,6 +153,37 @@ pub fn render_virtual_lines(
+     }
+ }
+ 
++pub struct ColorSwatch {
++    color: Color,
++    pos: usize,
++}
++
++impl ColorSwatch {
++    pub fn new(color: Color, pos: usize) -> Self {
++        ColorSwatch { color, pos }
++    }
++}
++
++impl Decoration for ColorSwatch {
++    fn decorate_grapheme(
++        &mut self,
++        _renderer: &mut TextRenderer,
++        _grapheme: &FormattedGrapheme,
++        style: &mut Style,
++    ) -> usize {
++        style.fg = Some(self.color);
++        usize::MAX
++    }
++
++    fn reset_pos(&mut self, pos: usize) -> usize {
++        if self.pos >= pos {
++            self.pos
++        } else {
++            usize::MAX
++        }
++    }
++}
++
+ /// Cursor rendering is done externally so all the cursor decoration
+ /// does is save the position of primary cursor
+ pub struct Cursor<'a> {
+@@ -163,6 +203,7 @@ fn decorate_grapheme(
+         &mut self,
+         renderer: &mut TextRenderer,
+         grapheme: &FormattedGrapheme,
++        _style: &mut Style,
+     ) -> usize {
+         if renderer.column_in_bounds(grapheme.visual_pos.col, grapheme.width())
+             && renderer.offset.row < grapheme.visual_pos.row
+diff --git a/helix-term/src/ui/text_decorations/diagnostics.rs b/helix-term/src/ui/text_decorations/diagnostics.rs
+index fb82bcf5..8b5c0a5e 100644
+--- a/helix-term/src/ui/text_decorations/diagnostics.rs
++++ b/helix-term/src/ui/text_decorations/diagnostics.rs
+@@ -307,6 +307,7 @@ fn decorate_grapheme(
+         &mut self,
+         renderer: &mut TextRenderer,
+         grapheme: &FormattedGrapheme,
++        _style: &mut Style,
+     ) -> usize {
+         self.state
+             .proccess_anchor(grapheme, renderer.viewport.width, renderer.offset.col)
+diff --git a/helix-view/src/document.rs b/helix-view/src/document.rs
+index 14628988..2530a1f5 100644
+--- a/helix-view/src/document.rs
++++ b/helix-view/src/document.rs
+@@ -39,6 +39,7 @@
+     ChangeSet, Diagnostic, LineEnding, Range, Rope, RopeBuilder, Selection, Syntax, Transaction,
+ };
+ 
++use crate::theme::Color;
+ use crate::{
+     editor::Config,
+     events::{DocumentDidChange, SelectionDidChange},
+@@ -143,10 +144,15 @@ pub struct Document {
+     ///
+     /// To know if they're up-to-date, check the `id` field in `DocumentInlayHints`.
+     pub(crate) inlay_hints: HashMap<ViewId, DocumentInlayHints>,
++    /// Color swatches for the document
++    ///
++    /// To know if they're up-to-date, check the `id` field in `DocumentColorSwatches`.
++    pub(crate) color_swatches: HashMap<ViewId, DocumentColorSwatches>,
+     pub(crate) jump_labels: HashMap<ViewId, Vec<Overlay>>,
+     /// Set to `true` when the document is updated, reset to `false` on the next inlay hints
+     /// update from the LSP
+     pub inlay_hints_oudated: bool,
++    pub color_swatches_outdated: bool,
+ 
+     path: Option<PathBuf>,
+     relative_path: OnceCell<Option<PathBuf>>,
+@@ -265,6 +271,50 @@ pub struct DocumentInlayHintsId {
+     pub last_line: usize,
+ }
+ 
++/// Color swatches for a single `(Document, View)` combo.
++///
++/// Color swatches are always `InlineAnnotation`s, not overlays or line-ones: LSP may choose to place
++/// them anywhere in the text and will sometime offer config options to move them where the user
++/// wants them but it shouldn't be Helix who decides that so we use the most precise positioning.
++///
++/// To get a tuple of corresponding (Color, Color Swatch) use zip(color_swatches, colors)
++#[derive(Debug, Clone)]
++pub struct DocumentColorSwatches {
++    /// Identifier for the color swatches stored in this structure. To be checked to know if they have
++    /// to be recomputed on idle or not.
++    pub id: ColorSwatchesId,
++
++    pub color_swatches: Vec<InlineAnnotation>,
++    pub color_swatches_padding: Vec<InlineAnnotation>,
++    pub colors: Vec<Color>,
++}
++
++impl DocumentColorSwatches {
++    /// Generate an empty list of color swatches with the given ID.
++    pub fn empty_with_id(id: ColorSwatchesId) -> Self {
++        Self {
++            id,
++            color_swatches: vec![],
++            color_swatches_padding: vec![],
++            colors: vec![],
++        }
++    }
++}
++
++/// Associated with a [`Document`] and [`ViewId`], uniquely identifies the state of color swatches for
++/// for that document and view: if this changed since the last save, the color swatches for the view
++/// should be recomputed.
++///
++/// We can't store the `ViewOffset` instead of the first and last asked-for lines because if
++/// softwrapping changes, the `ViewOffset` may not change while the displayed lines will.
++#[derive(Debug, Copy, Clone, PartialEq, Eq)]
++pub struct ColorSwatchesId {
++    /// First line for which the document color was requested.
++    pub first_line: usize,
++    /// Last line for which the document color was requested.
++    pub last_line: usize,
++}
++
+ use std::{fmt, mem};
+ impl fmt::Debug for Document {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+@@ -274,6 +324,7 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             .field("selections", &self.selections)
+             .field("inlay_hints_oudated", &self.inlay_hints_oudated)
+             .field("text_annotations", &self.inlay_hints)
++            .field("color_swatches", &self.color_swatches)
+             .field("view_data", &self.view_data)
+             .field("path", &self.path)
+             .field("encoding", &self.encoding)
+@@ -676,6 +727,8 @@ pub fn from(
+             selections: HashMap::default(),
+             inlay_hints: HashMap::default(),
+             inlay_hints_oudated: false,
++            color_swatches: HashMap::default(),
++            color_swatches_outdated: false,
+             view_data: Default::default(),
+             indent_style: DEFAULT_INDENT,
+             line_ending,
+@@ -1286,10 +1339,11 @@ pub fn mark_as_focused(&mut self) {
+         self.focused_at = std::time::Instant::now();
+     }
+ 
+-    /// Remove a view's selection and inlay hints from this document.
++    /// Remove a view's selection, inlay hints and color swatches from this document.
+     pub fn remove_view(&mut self, view_id: ViewId) {
+         self.selections.remove(&view_id);
+         self.inlay_hints.remove(&view_id);
++        self.color_swatches.remove(&view_id);
+         self.jump_labels.remove(&view_id);
+     }
+ 
+@@ -1410,8 +1464,8 @@ fn apply_impl(
+         self.diagnostics
+             .sort_by_key(|diagnostic| (diagnostic.range, diagnostic.severity, diagnostic.provider));
+ 
+-        // Update the inlay hint annotations' positions, helping ensure they are displayed in the proper place
+-        let apply_inlay_hint_changes = |annotations: &mut Vec<InlineAnnotation>| {
++        // Update the inline annotations' positions, helping ensure they are displayed in the proper place
++        let apply_inline_annotations_changes = |annotations: &mut Vec<InlineAnnotation>| {
+             changes.update_positions(
+                 annotations
+                     .iter_mut()
+@@ -1420,6 +1474,8 @@ fn apply_impl(
+         };
+ 
+         self.inlay_hints_oudated = true;
++        self.color_swatches_outdated = true;
++
+         for text_annotation in self.inlay_hints.values_mut() {
+             let DocumentInlayHints {
+                 id: _,
+@@ -1430,11 +1486,23 @@ fn apply_impl(
+                 padding_after_inlay_hints,
+             } = text_annotation;
+ 
+-            apply_inlay_hint_changes(padding_before_inlay_hints);
+-            apply_inlay_hint_changes(type_inlay_hints);
+-            apply_inlay_hint_changes(parameter_inlay_hints);
+-            apply_inlay_hint_changes(other_inlay_hints);
+-            apply_inlay_hint_changes(padding_after_inlay_hints);
++            apply_inline_annotations_changes(padding_before_inlay_hints);
++            apply_inline_annotations_changes(type_inlay_hints);
++            apply_inline_annotations_changes(parameter_inlay_hints);
++            apply_inline_annotations_changes(other_inlay_hints);
++            apply_inline_annotations_changes(padding_after_inlay_hints);
++        }
++
++        for text_annotation in self.color_swatches.values_mut() {
++            let DocumentColorSwatches {
++                id: _,
++                colors: _,
++                color_swatches,
++                color_swatches_padding,
++            } = text_annotation;
++
++            apply_inline_annotations_changes(color_swatches);
++            apply_inline_annotations_changes(color_swatches_padding);
+         }
+ 
+         helix_event::dispatch(DocumentDidChange {
+@@ -2164,6 +2232,11 @@ pub fn set_inlay_hints(&mut self, view_id: ViewId, inlay_hints: DocumentInlayHin
+         self.inlay_hints.insert(view_id, inlay_hints);
+     }
+ 
++    pub fn set_color_swatches(&mut self, view_id: ViewId, color_swatches: DocumentColorSwatches) {
++        self.color_swatches.insert(view_id, color_swatches);
++        self.color_swatches_outdated = false;
++    }
++
+     pub fn set_jump_labels(&mut self, view_id: ViewId, labels: Vec<Overlay>) {
+         self.jump_labels.insert(view_id, labels);
+     }
+@@ -2177,11 +2250,37 @@ pub fn inlay_hints(&self, view_id: ViewId) -> Option<&DocumentInlayHints> {
+         self.inlay_hints.get(&view_id)
+     }
+ 
++    /// Get the color swatches for this document and `view_id`.
++    pub fn color_swatches(&self, view_id: ViewId) -> Option<&DocumentColorSwatches> {
++        self.color_swatches.get(&view_id)
++    }
++
+     /// Completely removes all the inlay hints saved for the document, dropping them to free memory
+     /// (since it often means inlay hints have been fully deactivated).
+     pub fn reset_all_inlay_hints(&mut self) {
+         self.inlay_hints = Default::default();
+     }
++
++    /// Compute the range of lines for which inline annotations should be computed, which will be ~3 times the current view height.
++    /// That way some scrolling will not show half the view with annotations half without while still being faster than computing all the hints for the full file
++    pub fn inline_annotations_line_range(
++        &self,
++        view_height: usize,
++        view_id: ViewId,
++    ) -> (usize, usize) {
++        let doc_text = self.text();
++        let len_lines = doc_text.len_lines();
++
++        let first_visible_line =
++            doc_text.char_to_line(self.view_offset(view_id).anchor.min(doc_text.len_chars()));
++
++        let first_line = first_visible_line.saturating_sub(view_height);
++        let last_line = first_visible_line
++            .saturating_add(view_height.saturating_mul(2))
++            .min(len_lines);
++
++        (first_line, last_line)
++    }
+ }
+ 
+ #[derive(Debug, Default)]
+diff --git a/helix-view/src/editor.rs b/helix-view/src/editor.rs
+index 7eebe862..a9c00428 100644
+--- a/helix-view/src/editor.rs
++++ b/helix-view/src/editor.rs
+@@ -483,6 +483,8 @@ pub struct LspConfig {
+     pub display_signature_help_docs: bool,
+     /// Display inlay hints
+     pub display_inlay_hints: bool,
++    /// Display color swatches
++    pub display_color_swatches: bool,
+     /// Whether to enable snippet support
+     pub snippets: bool,
+     /// Whether to include declaration in the goto reference query
+@@ -498,6 +500,7 @@ fn default() -> Self {
+             auto_signature_help: true,
+             display_signature_help_docs: true,
+             display_inlay_hints: false,
++            display_color_swatches: true,
+             snippets: true,
+             goto_reference_include_declaration: true,
+         }
+diff --git a/helix-view/src/view.rs b/helix-view/src/view.rs
+index a229f01e..a30ce5be 100644
+--- a/helix-view/src/view.rs
++++ b/helix-view/src/view.rs
+@@ -1,7 +1,7 @@
+ use crate::{
+     align_view,
+     annotations::diagnostics::InlineDiagnostics,
+-    document::DocumentInlayHints,
++    document::{DocumentColorSwatches, DocumentInlayHints},
+     editor::{GutterConfig, GutterType},
+     graphics::Rect,
+     handlers::diagnostics::DiagnosticsHandler,
+@@ -481,6 +481,17 @@ pub fn text_annotations<'a>(
+                 .add_inline_annotations(other_inlay_hints, other_style)
+                 .add_inline_annotations(padding_after_inlay_hints, None);
+         };
++        if let Some(DocumentColorSwatches {
++            id: _,
++            colors: _,
++            color_swatches,
++            color_swatches_padding,
++        }) = doc.color_swatches.get(&self.id)
++        {
++            text_annotations
++                .add_inline_annotations(color_swatches, None)
++                .add_inline_annotations(color_swatches_padding, None);
++        };
+         let config = doc.config.load();
+         let width = self.inner_width(doc);
+         let enable_cursor_line = self
+-- 
+2.47.1
+
