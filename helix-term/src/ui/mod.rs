@@ -253,7 +253,8 @@ pub fn file_picker(root: PathBuf, config: &helix_view::editor::Config) -> FilePi
             cx.editor.set_error(err);
         }
     })
-    .with_preview(|_editor, path| Some((path.as_path().into(), None)));
+    .with_preview(|_editor, path| Some((path.as_path().into(), None)))
+    .with_title("Files");
     let injector = picker.injector();
     let timeout = std::time::Instant::now() + std::time::Duration::from_millis(30);
 
