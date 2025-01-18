@@ -338,6 +338,7 @@ pub enum LanguageServerFeature {
     Diagnostics,
     RenameSymbol,
     InlayHints,
+    ColorProvider,
 }
 
 impl Display for LanguageServerFeature {
@@ -361,6 +362,7 @@ impl Display for LanguageServerFeature {
             Diagnostics => "diagnostics",
             RenameSymbol => "rename-symbol",
             InlayHints => "inlay-hints",
+            ColorProvider => "color-provider",
         };
         write!(f, "{feature}",)
     }
